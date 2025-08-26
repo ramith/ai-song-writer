@@ -1,0 +1,225 @@
+openapi: 3.0.0
+info:
+  title: AI Song Lyrics Generator API
+  description: Generate original song lyrics using AI based on keywords, genre, emotion, and language
+  version: 1.0.0
+  contact:
+    name: Song Lyrics API Team
+    email: support@songlyrics.api
+
+servers:
+  - url: https://your-app.choreoapis.dev/songlyrics/v1
+    description: Production server
+  - url: http://localhost:8080/api/v1
+    description: Development server
+
+paths:
+  /health:
+    get:
+      summary: Health check endpoint
+      description: Returns the health status of the API
+      operationId: healthCheck
+      responses:
+        '200':
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /generate:
+    post:
+      summary: Generate song lyrics
+      description: Generate original song lyrics based on input parameters
+      operationId: generateLyrics
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LyricsRequest'
+            example:
+              keywords: ["love", "sunset", "journey"]
+              genre: "pop"
+              emotion: "romantic"
+              language: "english"
+              structure:
+                verses: 2
+                chorus: true
+                bridge: true
+      responses:
+        '200':
+          description: Lyrics generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LyricsResponse'
+        '400':
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    LyricsRequest:
+      type: object
+      required:
+        - keywords
+        - genre
+        - emotion
+        - language
+      properties:
+        keywords:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 10
+          description: Keywords to inspire the lyrics (1-10 words)
+          example: ["love", "sunset", "journey"]
+        genre:
+          type: string
+          enum: [pop, rock, country, hip-hop, r&b, jazz, folk, electronic, classical, reggae, blues, indie]
+          description: Musical genre for the lyrics
+          example: "pop"
+        emotion:
+          type: string
+          enum: [happy, sad, romantic, energetic, melancholic, hopeful, nostalgic, peaceful, excited, contemplative]
+          description: Emotional tone of the lyrics
+          example: "romantic"
+        language:
+          type: string
+          enum: [english, spanish, french, german, italian, portuguese, japanese, korean]
+          description: Language for the generated lyrics
+          example: "english"
+        structure:
+          $ref: '#/components/schemas/SongStructure'
+
+    SongStructure:
+      type: object
+      properties:
+        verses:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 2
+          description: Number of verses in the song
+          example: 2
+        chorus:
+          type: boolean
+          default: true
+          description: Whether to include a chorus
+          example: true
+        bridge:
+          type: boolean
+          default: false
+          description: Whether to include a bridge
+          example: true
+
+    LyricsResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique identifier for the generated lyrics
+          example: "123e4567-e89b-12d3-a456-426614174000"
+        lyrics:
+          $ref: '#/components/schemas/GeneratedLyrics'
+        metadata:
+          $ref: '#/components/schemas/LyricsMetadata'
+
+    GeneratedLyrics:
+      type: object
+      properties:
+        title:
+          type: string
+          description: Generated song title
+          example: "Love at Sunset"
+        structure:
+          type: object
+          additionalProperties:
+            type: string
+          description: Song sections with their lyrics
+          example:
+            verse1: "Walking down this winding road..."
+            chorus: "Love finds a way when the sunset glows..."
+            verse2: "Every journey has its story..."
+            bridge: "Through the valleys and the peaks..."
+
+    LyricsMetadata:
+      type: object
+      properties:
+        genre:
+          type: string
+          description: The genre used for generation
+          example: "pop"
+        emotion:
+          type: string
+          description: The emotion used for generation
+          example: "romantic"
+        language:
+          type: string
+          description: The language used for generation
+          example: "english"
+        keywords_used:
+          type: array
+          items:
+            type: string
+          description: Keywords that were incorporated
+          example: ["love", "sunset", "journey"]
+        created_at:
+          type: string
+          format: date-time
+          description: When the lyrics were generated
+          example: "2025-08-26T10:30:00Z"
+        word_count:
+          type: integer
+          description: Total number of words in the lyrics
+          example: 156
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          description: Health status of the API
+          example: "healthy"
+        timestamp:
+          type: string
+          format: date-time
+          description: Current server time
+          example: "2025-08-26T10:30:00Z"
+        version:
+          type: string
+          description: API version
+          example: "1.0.0"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error code
+          example: "invalid_request"
+        message:
+          type: string
+          description: Human-readable error message
+          example: "Invalid genre specified"
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+security:
+  - ApiKeyAuth: []
