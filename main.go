@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,6 +17,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/openai/openai-go/v2"
+	"github.com/openai/openai-go/v2/option"
 	"github.com/rs/zerolog"
 	zerologlog "github.com/rs/zerolog/log"
 )
@@ -53,46 +54,50 @@ type OAuthClient struct {
 	expiresAt   time.Time
 }
 
-// OpenAI API structures for AI Gateway proxy calls
-type OpenAIChatRequest struct {
-	Model       string              `json:"model"`
-	Messages    []OpenAIChatMessage `json:"messages"`
-	MaxTokens   int                 `json:"max_tokens,omitempty"`
-	Temperature float64             `json:"temperature,omitempty"`
+// OAuthTransport is a custom HTTP transport that automatically injects OAuth tokens
+type OAuthTransport struct {
+	oauthClient   *OAuthClient
+	baseTransport http.RoundTripper
 }
 
-type OpenAIChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+// RoundTrip implements the http.RoundTripper interface with OAuth token injection
+func (t *OAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Clone the request to avoid modifying the original
+	newReq := req.Clone(req.Context())
+	
+	// Get OAuth access token
+	token, err := t.oauthClient.GetAccessToken(req.Context())
+	if err != nil {
+		zerologlog.Error().Err(err).Msg("Failed to get OAuth token in transport")
+		return nil, fmt.Errorf("OAuth authentication failed in transport: %w", err)
+	}
+	
+	// Set Authorization header with Bearer token
+	newReq.Header.Set("Authorization", "Bearer "+token)
+	
+	// Log the request (with sanitized token)
+	zerologlog.Debug().
+		Str("method", newReq.Method).
+		Str("url", newReq.URL.String()).
+		Str("authorization", sanitizeForLogging("Bearer "+token)).
+		Msg("OAuth transport injecting token")
+	
+	// Use the base transport to make the actual request
+	return t.baseTransport.RoundTrip(newReq)
 }
 
-type OpenAIChatResponse struct {
-	ID      string               `json:"id"`
-	Object  string               `json:"object"`
-	Created int64                `json:"created"`
-	Model   string               `json:"model"`
-	Choices []OpenAIChatChoice   `json:"choices"`
-	Usage   OpenAIUsage          `json:"usage"`
-	Error   *OpenAIErrorResponse `json:"error,omitempty"`
+// NewOAuthTransport creates a new OAuth transport with the given OAuth client
+func NewOAuthTransport(oauthClient *OAuthClient) *OAuthTransport {
+	return &OAuthTransport{
+		oauthClient:   oauthClient,
+		baseTransport: http.DefaultTransport,
+	}
 }
 
-type OpenAIChatChoice struct {
-	Index        int               `json:"index"`
-	Message      OpenAIChatMessage `json:"message"`
-	FinishReason string            `json:"finish_reason"`
-}
-
-type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-type OpenAIErrorResponse struct {
-	Message string      `json:"message"`
-	Type    string      `json:"type"`
-	Param   interface{} `json:"param"`
-	Code    interface{} `json:"code"`
+// LyricsService handles the lyrics generation logic using OpenAI SDK with OAuth
+type LyricsService struct {
+	openaiClient *openai.Client
+	model        string
 }
 
 // sanitizeForLogging removes sensitive information from strings for logging
@@ -301,21 +306,27 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// LyricsService handles the lyrics generation logic using AI Gateway with OAuth
-type LyricsService struct {
-	httpClient  *http.Client
-	oauthClient *OAuthClient
-	gatewayURL  string
-	model       string
-}
-
-// NewLyricsService creates a new lyrics service with AI Gateway and OAuth
+// NewLyricsService creates a new lyrics service with OpenAI SDK and OAuth transport
 func NewLyricsService(gatewayURL, model string, oauthClient *OAuthClient) *LyricsService {
+	// Create OAuth transport
+	oauthTransport := NewOAuthTransport(oauthClient)
+	
+	// Create HTTP client with OAuth transport
+	httpClient := &http.Client{
+		Transport: oauthTransport,
+		Timeout:   30 * time.Second,
+	}
+	
+	// Create OpenAI client with custom base URL and HTTP client
+	openaiClient := openai.NewClient(
+		option.WithBaseURL(gatewayURL),
+		option.WithHTTPClient(httpClient),
+		option.WithAPIKey(""), // Disable default API key since we use OAuth
+	)
+	
 	return &LyricsService{
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
-		oauthClient: oauthClient,
-		gatewayURL:  gatewayURL,
-		model:       model,
+		openaiClient: &openaiClient,
+		model:        model,
 	}
 }
 
@@ -418,9 +429,9 @@ func main() {
 		Str("gateway_url", gatewayURL).
 		Str("consumer_key", sanitizeForLogging(consumerKey)).
 		Str("model", openaiModel).
-		Msg("Initializing AI Gateway with OAuth Client Credentials")
+		Msg("Initializing OpenAI SDK with AI Gateway and OAuth Client Credentials")
 
-	// Initialize services with AI Gateway
+	// Initialize services with OpenAI SDK and AI Gateway
 	lyricsService := NewLyricsService(gatewayURL, openaiModel, oauthClient)
 
 	// Setup Gin router
@@ -558,110 +569,44 @@ func generateLyrics(service *LyricsService) gin.HandlerFunc {
 	}
 }
 
-// GenerateLyrics generates song lyrics using AI Gateway with OAuth authentication
+// GenerateLyrics generates song lyrics using OpenAI SDK with OAuth transport
 func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (*LyricsResponse, error) {
 	// Create prompt
 	prompt := s.buildPrompt(req)
 
-	// Get OAuth access token
-	accessToken, err := s.oauthClient.GetAccessToken(ctx)
-	if err != nil {
-		zerologlog.Error().Err(err).Msg("Failed to get OAuth access token")
-		return nil, fmt.Errorf("OAuth authentication failed: %w", err)
-	}
-
-	// Prepare OpenAI request for AI Gateway
-	openaiReq := OpenAIChatRequest{
-		Model: s.model,
-		Messages: []OpenAIChatMessage{
-			{Role: "system", Content: promptSystem()},
-			{Role: "user", Content: prompt},
-		},
-		MaxTokens:   1000,
-		Temperature: 0.8,
-	}
-
-	// Serialize request
-	reqBody, err := json.Marshal(openaiReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// Create HTTP request to AI Gateway
-	url := s.gatewayURL + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers with OAuth Bearer token
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+accessToken)
-
-	// Log request (with sanitization)
 	zerologlog.Debug().
 		Str("model", s.model).
-		Str("gateway_url", url).
 		Str("prompt", sanitizeForLogging(prompt)).
-		Str("authorization", sanitizeForLogging("Bearer "+accessToken)).
 		Interface("request", req).
-		Msg("Sending request to AI Gateway")
+		Msg("Sending request to OpenAI via AI Gateway")
 
-	// Make HTTP request
-	resp, err := s.httpClient.Do(httpReq)
+	// Use OpenAI SDK with automatic OAuth token injection via transport
+	completion, err := s.openaiClient.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model: openai.ChatModelGPT3_5Turbo, // Default model, can be overridden via env
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage(promptSystem()),
+			openai.UserMessage(prompt),
+		},
+		MaxTokens:   openai.Int(1000),
+		Temperature: openai.Float(0.8),
+	})
+
 	if err != nil {
 		zerologlog.Error().Err(err).
 			Str("model", s.model).
-			Str("gateway_url", url).
-			Msg("AI Gateway HTTP request failed")
-		return nil, fmt.Errorf("AI Gateway HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	// Parse response
-	var openaiResp OpenAIChatResponse
-	if err := json.Unmarshal(body, &openaiResp); err != nil {
-		zerologlog.Error().Err(err).
-			Str("body", string(body)).
-			Msg("Failed to parse AI Gateway response")
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	// Check for API errors
-	if openaiResp.Error != nil {
-		zerologlog.Error().
-			Str("error_type", openaiResp.Error.Type).
-			Str("error_message", openaiResp.Error.Message).
-			Interface("error_code", openaiResp.Error.Code).
-			Msg("AI Gateway API error")
-		return nil, fmt.Errorf("AI Gateway API error: %s", openaiResp.Error.Message)
-	}
-
-	// Check HTTP status
-	if resp.StatusCode != http.StatusOK {
-		zerologlog.Error().
-			Int("status_code", resp.StatusCode).
-			Str("body", string(body)).
-			Msg("AI Gateway returned non-200 status")
-		return nil, fmt.Errorf("AI Gateway returned status %d: %s", resp.StatusCode, string(body))
+			Msg("OpenAI SDK request failed")
+		return nil, fmt.Errorf("OpenAI SDK request failed: %w", err)
 	}
 
 	// Validate response
-	if len(openaiResp.Choices) == 0 {
+	if len(completion.Choices) == 0 {
 		zerologlog.Error().
 			Str("model", s.model).
-			Str("response", string(body)).
-			Msg("AI Gateway returned no choices")
-		return nil, fmt.Errorf("no response from AI Gateway")
+			Msg("OpenAI returned no choices")
+		return nil, fmt.Errorf("no response from OpenAI")
 	}
 
-	generatedText := openaiResp.Choices[0].Message.Content
+	generatedText := completion.Choices[0].Message.Content
 	lyrics := s.parseLyrics(generatedText, req)
 	wordCount := s.countWords(generatedText)
 
@@ -682,7 +627,11 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 		Str("response_id", lyricsResponse.ID).
 		Int("word_count", wordCount).
 		Str("title", lyrics.Title).
-		Msg("Successfully generated lyrics via AI Gateway")
+		Str("finish_reason", string(completion.Choices[0].FinishReason)).
+		Int64("prompt_tokens", completion.Usage.PromptTokens).
+		Int64("completion_tokens", completion.Usage.CompletionTokens).
+		Int64("total_tokens", completion.Usage.TotalTokens).
+		Msg("Successfully generated lyrics via OpenAI SDK")
 
 	return lyricsResponse, nil
 }
