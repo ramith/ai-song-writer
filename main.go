@@ -64,24 +64,24 @@ type OAuthTransport struct {
 func (t *OAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Clone the request to avoid modifying the original
 	newReq := req.Clone(req.Context())
-	
+
 	// Get OAuth access token
 	token, err := t.oauthClient.GetAccessToken(req.Context())
 	if err != nil {
 		zerologlog.Error().Err(err).Msg("Failed to get OAuth token in transport")
 		return nil, fmt.Errorf("OAuth authentication failed in transport: %w", err)
 	}
-	
+
 	// Set Authorization header with Bearer token
 	newReq.Header.Set("Authorization", "Bearer "+token)
-	
+
 	// Log the request (with sanitized token)
 	zerologlog.Debug().
 		Str("method", newReq.Method).
 		Str("url", newReq.URL.String()).
 		Str("authorization", sanitizeForLogging("Bearer "+token)).
 		Msg("OAuth transport injecting token")
-	
+
 	// Use the base transport to make the actual request
 	return t.baseTransport.RoundTrip(newReq)
 }
@@ -310,20 +310,20 @@ type ErrorResponse struct {
 func NewLyricsService(gatewayURL, model string, oauthClient *OAuthClient) *LyricsService {
 	// Create OAuth transport
 	oauthTransport := NewOAuthTransport(oauthClient)
-	
+
 	// Create HTTP client with OAuth transport
 	httpClient := &http.Client{
 		Transport: oauthTransport,
 		Timeout:   30 * time.Second,
 	}
-	
+
 	// Create OpenAI client with custom base URL and HTTP client
 	openaiClient := openai.NewClient(
 		option.WithBaseURL(gatewayURL),
 		option.WithHTTPClient(httpClient),
 		option.WithAPIKey(""), // Disable default API key since we use OAuth
 	)
-	
+
 	return &LyricsService{
 		openaiClient: &openaiClient,
 		model:        model,
@@ -651,7 +651,7 @@ Include bridge: %t
 
 Requirements:
 - Family-friendly content only (suitable for all ages)
-- No explicit language, violence, or inappropriate themes
+- Use positive language and uplifting themes
 - Creative and engaging lyrics that flow well
 - Natural incorporation of the provided keywords
 - Clear structure with labeled sections
