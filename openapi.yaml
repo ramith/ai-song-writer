@@ -1,7 +1,15 @@
 openapi: 3.0.0
 info:
   title: AI Song Lyrics Generator API
-  description: Generate original song lyrics using AI based on keywords, genre, emotion, and language
+  description: |
+    Generate original song lyrics using AI based on keywords, genre, emotion, and language.
+    
+    Features:
+    - Multiple genre support including metal, pop, rock, country, and more
+    - Emotion-based lyrics generation with 10 different moods
+    - Multi-language support for 8 languages
+    - Content safety filtering for appropriate content
+    - Structured song output with customizable verse/chorus/bridge sections
   version: 1.0.0
   contact:
     name: Song Lyrics API Team
@@ -60,12 +68,61 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalid_request:
+                  summary: Invalid request format
+                  value:
+                    error: "invalid_request"
+                    message: "JSON parsing error or missing required fields"
+                invalid_genre:
+                  summary: Unsupported genre
+                  value:
+                    error: "invalid_genre"
+                    message: "Unsupported genre. Supported genres: pop, rock, metal, country, hip-hop, r&b, jazz, folk, electronic, classical, reggae, blues, indie"
+                invalid_emotion:
+                  summary: Unsupported emotion
+                  value:
+                    error: "invalid_emotion"
+                    message: "Unsupported emotion. Supported emotions: happy, sad, romantic, energetic, melancholic, hopeful, nostalgic, peaceful, excited, contemplative"
+                invalid_language:
+                  summary: Unsupported language
+                  value:
+                    error: "invalid_language"
+                    message: "Unsupported language. Supported languages: english, spanish, french, german, italian, portuguese, japanese, korean"
+                content_blocked:
+                  summary: Content safety violation
+                  value:
+                    error: "content_blocked"
+                    message: "Your request contains content that violates our content safety policies. Please modify your keywords and try again with appropriate content."
+                content_filtered:
+                  summary: Content filtered for safety
+                  value:
+                    error: "content_filtered"
+                    message: "Your request was filtered for safety reasons. Please try different keywords or themes that are more appropriate."
         '500':
           description: Internal server error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                generation_failed:
+                  summary: General generation failure
+                  value:
+                    error: "generation_failed"
+                    message: "Failed to generate lyrics. Please try again."
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                service_unavailable:
+                  summary: AI Gateway unavailable
+                  value:
+                    error: "service_unavailable"
+                    message: "The AI service is temporarily unavailable. Please try again in a few moments."
 
 components:
   schemas:
@@ -87,7 +144,7 @@ components:
           example: ["love", "sunset", "journey"]
         genre:
           type: string
-          enum: [pop, rock, country, hip-hop, r&b, jazz, folk, electronic, classical, reggae, blues, indie]
+          enum: [pop, rock, metal, country, hip-hop, r&b, jazz, folk, electronic, classical, reggae, blues, indie]
           description: Musical genre for the lyrics
           example: "pop"
         emotion:
@@ -215,11 +272,4 @@ components:
           description: Human-readable error message
           example: "Invalid genre specified"
 
-  securitySchemes:
-    ApiKeyAuth:
-      type: apiKey
-      in: header
-      name: X-API-Key
 
-security:
-  - ApiKeyAuth: []

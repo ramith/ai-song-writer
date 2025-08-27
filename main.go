@@ -40,6 +40,33 @@ type OAuthTokenResponse struct {
 	ErrorDesc   string `json:"error_description,omitempty"`
 }
 
+// Azure Content Safety response structures
+type AzureContentSafetyResponse struct {
+	Code    int                   `json:"code"`
+	Message AzureContentSafetyMsg `json:"message"`
+	Type    string                `json:"type"`
+}
+
+type AzureContentSafetyMsg struct {
+	Action       string                        `json:"action"`
+	ActionReason string                        `json:"actionReason"`
+	Assessments  AzureContentSafetyAssessments `json:"assessments"`
+	Direction    string                        `json:"direction"`
+	Guardrail    string                        `json:"interveningGuardrail"`
+}
+
+type AzureContentSafetyAssessments struct {
+	Categories       []AzureContentCategory `json:"categories"`
+	InspectedContent string                 `json:"inspectedContent"`
+}
+
+type AzureContentCategory struct {
+	Category  string `json:"category"`
+	Result    string `json:"result"`
+	Severity  int    `json:"severity"`
+	Threshold int    `json:"threshold"`
+}
+
 // OAuth Client manages token lifecycle
 type OAuthClient struct {
 	httpClient    *http.Client
@@ -251,7 +278,7 @@ func (o *OAuthClient) requestNewToken(ctx context.Context) (string, error) {
 
 // promptSystem returns the system prompt for the OpenAI model
 func promptSystem() string {
-	return "You are a professional songwriter who creates family-friendly, appropriate lyrics for all ages. Always ensure content is positive and suitable for children."
+	return "You are a professional songwriter who creates song lyrics based on the provided specifications. Follow the user's requirements for genre, emotion, and keywords while maintaining good lyrical structure and flow."
 }
 
 // LyricsRequest represents the input for lyrics generation
@@ -334,6 +361,7 @@ func NewLyricsService(gatewayURL, model string, oauthClient *OAuthClient) *Lyric
 var ValidGenres = map[string]bool{
 	"pop":        true,
 	"rock":       true,
+	"metal":      true,
 	"country":    true,
 	"hip-hop":    true,
 	"r&b":        true,
@@ -558,10 +586,30 @@ func generateLyrics(service *LyricsService) gin.HandlerFunc {
 		response, err := service.GenerateLyrics(c.Request.Context(), req)
 		if err != nil {
 			zerologlog.Error().Err(err).Msg("Error generating lyrics")
-			c.JSON(http.StatusInternalServerError, ErrorResponse{
-				Error:   "generation_failed",
-				Message: "Failed to generate lyrics. Please try again.",
-			})
+
+			// Provide specific error messages based on error type
+			switch err.Error() {
+			case "content_safety_violation":
+				c.JSON(http.StatusBadRequest, ErrorResponse{
+					Error:   "content_blocked",
+					Message: "Your request contains content that violates our content safety policies. Please modify your keywords and try again with appropriate content.",
+				})
+			case "content_filtered":
+				c.JSON(http.StatusBadRequest, ErrorResponse{
+					Error:   "content_filtered",
+					Message: "Your request was filtered for safety reasons. Please try different keywords or themes that are more appropriate.",
+				})
+			case "gateway_service_unavailable":
+				c.JSON(http.StatusServiceUnavailable, ErrorResponse{
+					Error:   "service_unavailable",
+					Message: "The AI service is temporarily unavailable. Please try again in a few moments.",
+				})
+			default:
+				c.JSON(http.StatusInternalServerError, ErrorResponse{
+					Error:   "generation_failed",
+					Message: "Failed to generate lyrics. Please try again.",
+				})
+			}
 			return
 		}
 
@@ -592,10 +640,36 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 	})
 
 	if err != nil {
+		// Check if this is a content safety violation
+		if strings.Contains(err.Error(), "446") || strings.Contains(err.Error(), "GUARDRAIL_INTERVENED") ||
+			strings.Contains(err.Error(), "AZURE_CONTENT_SAFETY") {
+			zerologlog.Warn().Err(err).
+				Str("model", s.model).
+				Interface("request", req).
+				Msg("Content safety guardrail blocked request")
+			return nil, fmt.Errorf("content_safety_violation")
+		}
+
+		// Check for generic gateway errors (502, 404, etc.)
+		if strings.Contains(err.Error(), "502") || strings.Contains(err.Error(), "Bad Gateway") {
+			zerologlog.Error().Err(err).
+				Str("model", s.model).
+				Msg("AI Gateway service unavailable")
+			return nil, fmt.Errorf("gateway_service_unavailable")
+		}
+
+		if strings.Contains(err.Error(), "The requested resource is not available") {
+			zerologlog.Warn().Err(err).
+				Str("model", s.model).
+				Interface("request", req).
+				Msg("Request blocked by content filtering")
+			return nil, fmt.Errorf("content_filtered")
+		}
+
 		zerologlog.Error().Err(err).
 			Str("model", s.model).
 			Msg("OpenAI SDK request failed")
-		return nil, fmt.Errorf("OpenAI SDK request failed: %w", err)
+		return nil, fmt.Errorf("openai_request_failed")
 	}
 
 	// Validate response
@@ -650,8 +724,6 @@ Include chorus: %t
 Include bridge: %t
 
 Requirements:
-- Family-friendly content only (suitable for all ages)
-- Use positive language and uplifting themes
 - Creative and engaging lyrics that flow well
 - Natural incorporation of the provided keywords
 - Clear structure with labeled sections
