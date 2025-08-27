@@ -482,11 +482,8 @@ func main() {
 	// Health check endpoint
 	router.GET("/health", healthCheck)
 
-	// API v1 routes
-	v1 := router.Group("/api/v1")
-	{
-		v1.POST("/generate", generateLyrics(lyricsService))
-	}
+	// API routes
+	router.POST("/generate", generateLyrics(lyricsService))
 
 	// Create HTTP server
 	srv := &http.Server{
