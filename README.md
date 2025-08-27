@@ -213,6 +213,7 @@ All generated lyrics are:
 - **API Designer**: Crafts clear, scalable, and well-documented APIs for internal and external use.
 - **Product Manager**: Defines product vision, prioritizes features, and ensures alignment with user needs and business goals.
 - **Business Analyst**: Gathers requirements, analyzes market trends, and translates business needs into actionable technical tasks.
+- **QA Engineer**: Conducts comprehensive testing including API testing, quality assurance, test automation, and bug reporting to ensure product reliability.
 
 *If you are interested in contributing as one of these roles, please open an issue or pull request!*
 

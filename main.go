@@ -1,19 +1,88 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
-	"github.com/sashabaranov/go-openai"
+	"github.com/rs/zerolog"
+	zerologlog "github.com/rs/zerolog/log"
 )
+
+// OpenAI API structures for direct HTTP calls
+type OpenAIChatRequest struct {
+	Model       string              `json:"model"`
+	Messages    []OpenAIChatMessage `json:"messages"`
+	MaxTokens   int                 `json:"max_tokens,omitempty"`
+	Temperature float64             `json:"temperature,omitempty"`
+}
+
+type OpenAIChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OpenAIChatResponse struct {
+	ID      string               `json:"id"`
+	Object  string               `json:"object"`
+	Created int64                `json:"created"`
+	Model   string               `json:"model"`
+	Choices []OpenAIChatChoice   `json:"choices"`
+	Usage   OpenAIUsage          `json:"usage"`
+	Error   *OpenAIErrorResponse `json:"error,omitempty"`
+}
+
+type OpenAIChatChoice struct {
+	Index        int               `json:"index"`
+	Message      OpenAIChatMessage `json:"message"`
+	FinishReason string            `json:"finish_reason"`
+}
+
+type OpenAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type OpenAIErrorResponse struct {
+	Message string      `json:"message"`
+	Type    string      `json:"type"`
+	Param   interface{} `json:"param"`
+	Code    interface{} `json:"code"`
+}
+
+// sanitizeForLogging removes sensitive information from strings for logging
+func sanitizeForLogging(input string) string {
+	if strings.Contains(strings.ToLower(input), "bearer ") {
+		return "[REDACTED_API_KEY]"
+	}
+	if strings.HasPrefix(strings.ToLower(input), "sk-") {
+		return "[REDACTED_API_KEY]"
+	}
+	// Redact any string that looks like an API key (starts with common prefixes)
+	for _, prefix := range []string{"sk-", "pk-", "api_", "token_"} {
+		if strings.HasPrefix(strings.ToLower(input), prefix) {
+			return "[REDACTED_API_KEY]"
+		}
+	}
+	return input
+}
+
+// promptSystem returns the system prompt for the OpenAI model
+func promptSystem() string {
+	return "You are a professional songwriter who creates family-friendly, appropriate lyrics for all ages. Always ensure content is positive and suitable for children."
+}
 
 // LyricsRequest represents the input for lyrics generation
 type LyricsRequest struct {
@@ -67,16 +136,24 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// LyricsService handles the lyrics generation logic
+// LyricsService handles the lyrics generation logic using direct HTTP calls
 type LyricsService struct {
-	openaiClient *openai.Client
+	httpClient *http.Client
+	apiKey     string
+	baseURL    string
+	model      string
 }
 
-// NewLyricsService creates a new lyrics service
-func NewLyricsService(apiKey string) *LyricsService {
-	client := openai.NewClient(apiKey)
+// NewLyricsService creates a new lyrics service with direct HTTP API calls
+func NewLyricsService(apiKey, baseURL, model string) *LyricsService {
+	if baseURL == "" {
+		baseURL = "https://api.openai.com"
+	}
 	return &LyricsService{
-		openaiClient: client,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiKey:     apiKey,
+		baseURL:    baseURL,
+		model:      model,
 	}
 }
 
@@ -125,13 +202,29 @@ var ValidLanguages = map[string]bool{
 func main() {
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found")
+		zerologlog.Info().Msg("No .env file found")
+	}
+
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	if os.Getenv("GIN_MODE") == "release" {
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	} else {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 
 	// Get OpenAI API key
 	openaiKey := os.Getenv("OPENAI_API_KEY")
 	if openaiKey == "" {
-		log.Fatal("OPENAI_API_KEY environment variable is required")
+		zerologlog.Fatal().Msg("OPENAI_API_KEY environment variable is required")
+	}
+
+	// Get custom OpenAI base URL (optional)
+	openaiBaseURL := os.Getenv("OPENAI_BASE_URL")
+
+	// Get model version (default: gpt-3.5-turbo)
+	openaiModel := os.Getenv("OPENAI_MODEL")
+	if openaiModel == "" {
+		openaiModel = "gpt-3.5-turbo"
 	}
 
 	// Get port from environment or default to 8080
@@ -141,7 +234,7 @@ func main() {
 	}
 
 	// Initialize services
-	lyricsService := NewLyricsService(openaiKey)
+	lyricsService := NewLyricsService(openaiKey, openaiBaseURL, openaiModel)
 
 	// Setup Gin router
 	router := gin.Default()
@@ -169,9 +262,39 @@ func main() {
 		v1.POST("/generate", generateLyrics(lyricsService))
 	}
 
-	// Start server
-	log.Printf("Starting server on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, router))
+	// Create HTTP server
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: router,
+	}
+
+	// Start server in a goroutine
+	go func() {
+		zerologlog.Info().Str("port", port).Msg("Starting server")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			zerologlog.Fatal().Err(err).Msg("Server failed to start")
+		}
+	}()
+
+	// Set up signal handling for graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for interrupt signal
+	<-quit
+	zerologlog.Info().Msg("Received shutdown signal, gracefully shutting down server...")
+
+	// Create a context with timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Attempt graceful shutdown
+	if err := srv.Shutdown(ctx); err != nil {
+		zerologlog.Error().Err(err).Msg("Server forced to shutdown")
+		return
+	}
+
+	zerologlog.Info().Msg("Server exited gracefully")
 }
 
 // healthCheck returns the health status of the API
@@ -236,7 +359,7 @@ func generateLyrics(service *LyricsService) gin.HandlerFunc {
 		// Generate lyrics
 		response, err := service.GenerateLyrics(c.Request.Context(), req)
 		if err != nil {
-			log.Printf("Error generating lyrics: %v", err)
+			zerologlog.Error().Err(err).Msg("Error generating lyrics")
 			c.JSON(http.StatusInternalServerError, ErrorResponse{
 				Error:   "generation_failed",
 				Message: "Failed to generate lyrics. Please try again.",
@@ -248,47 +371,105 @@ func generateLyrics(service *LyricsService) gin.HandlerFunc {
 	}
 }
 
-// GenerateLyrics generates song lyrics using OpenAI
+// GenerateLyrics generates song lyrics using direct OpenAI HTTP API
 func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (*LyricsResponse, error) {
 	// Create prompt
 	prompt := s.buildPrompt(req)
 
-	// Call OpenAI API
-	response, err := s.openaiClient.CreateChatCompletion(
-		ctx,
-		openai.ChatCompletionRequest{
-			Model: openai.GPT3Dot5Turbo,
-			Messages: []openai.ChatCompletionMessage{
-				{
-					Role:    openai.ChatMessageRoleSystem,
-					Content: "You are a professional songwriter who creates family-friendly, appropriate lyrics for all ages. Always ensure content is positive and suitable for children.",
-				},
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: prompt,
-				},
-			},
-			MaxTokens:   1000,
-			Temperature: 0.8,
+	// Prepare OpenAI request
+	openaiReq := OpenAIChatRequest{
+		Model: s.model,
+		Messages: []OpenAIChatMessage{
+			{Role: "system", Content: promptSystem()},
+			{Role: "user", Content: prompt},
 		},
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf("OpenAI API error: %w", err)
+		MaxTokens:   1000,
+		Temperature: 0.8,
 	}
 
-	if len(response.Choices) == 0 {
+	// Serialize request
+	reqBody, err := json.Marshal(openaiReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Create HTTP request
+	url := s.baseURL + "/v1/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+
+	// Log request (with sanitization)
+	zerologlog.Debug().
+		Str("model", s.model).
+		Str("url", url).
+		Str("prompt", sanitizeForLogging(prompt)).
+		Interface("request", req).
+		Msg("Sending request to OpenAI")
+
+	// Make HTTP request
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		zerologlog.Error().Err(err).
+			Str("model", s.model).
+			Str("url", url).
+			Msg("HTTP request failed")
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Parse response
+	var openaiResp OpenAIChatResponse
+	if err := json.Unmarshal(body, &openaiResp); err != nil {
+		zerologlog.Error().Err(err).
+			Str("body", string(body)).
+			Msg("Failed to parse OpenAI response")
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Check for API errors
+	if openaiResp.Error != nil {
+		zerologlog.Error().
+			Str("error_type", openaiResp.Error.Type).
+			Str("error_message", openaiResp.Error.Message).
+			Interface("error_code", openaiResp.Error.Code).
+			Msg("OpenAI API error")
+		return nil, fmt.Errorf("OpenAI API error: %s", openaiResp.Error.Message)
+	}
+
+	// Check HTTP status
+	if resp.StatusCode != http.StatusOK {
+		zerologlog.Error().
+			Int("status_code", resp.StatusCode).
+			Str("body", string(body)).
+			Msg("OpenAI API returned non-200 status")
+		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Validate response
+	if len(openaiResp.Choices) == 0 {
+		zerologlog.Error().
+			Str("model", s.model).
+			Str("response", string(body)).
+			Msg("OpenAI API returned no choices")
 		return nil, fmt.Errorf("no response from OpenAI")
 	}
 
-	// Parse and structure the response
-	generatedText := response.Choices[0].Message.Content
+	generatedText := openaiResp.Choices[0].Message.Content
 	lyrics := s.parseLyrics(generatedText, req)
-
-	// Count words
 	wordCount := s.countWords(generatedText)
 
-	// Create response
 	lyricsResponse := &LyricsResponse{
 		ID:     uuid.New().String(),
 		Lyrics: lyrics,
@@ -301,6 +482,12 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 			WordCount:    wordCount,
 		},
 	}
+
+	zerologlog.Debug().
+		Str("response_id", lyricsResponse.ID).
+		Int("word_count", wordCount).
+		Str("title", lyrics.Title).
+		Msg("Successfully generated lyrics")
 
 	return lyricsResponse, nil
 }
