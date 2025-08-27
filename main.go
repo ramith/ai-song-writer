@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,7 +22,38 @@ import (
 	zerologlog "github.com/rs/zerolog/log"
 )
 
-// OpenAI API structures for direct HTTP calls
+// OAuth 2.0 Client Credentials structures
+type OAuthTokenRequest struct {
+	GrantType    string `json:"grant_type"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	Scope        string `json:"scope,omitempty"`
+}
+
+type OAuthTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+	Scope       string `json:"scope,omitempty"`
+	Error       string `json:"error,omitempty"`
+	ErrorDesc   string `json:"error_description,omitempty"`
+}
+
+// OAuth Client manages token lifecycle
+type OAuthClient struct {
+	httpClient    *http.Client
+	tokenEndpoint string
+	clientID      string
+	clientSecret  string
+	scope         string
+
+	// Token management
+	mutex       sync.RWMutex
+	accessToken string
+	expiresAt   time.Time
+}
+
+// OpenAI API structures for AI Gateway proxy calls
 type OpenAIChatRequest struct {
 	Model       string              `json:"model"`
 	Messages    []OpenAIChatMessage `json:"messages"`
@@ -65,18 +98,150 @@ type OpenAIErrorResponse struct {
 // sanitizeForLogging removes sensitive information from strings for logging
 func sanitizeForLogging(input string) string {
 	if strings.Contains(strings.ToLower(input), "bearer ") {
-		return "[REDACTED_API_KEY]"
+		return "[REDACTED_BEARER_TOKEN]"
 	}
 	if strings.HasPrefix(strings.ToLower(input), "sk-") {
 		return "[REDACTED_API_KEY]"
 	}
-	// Redact any string that looks like an API key (starts with common prefixes)
-	for _, prefix := range []string{"sk-", "pk-", "api_", "token_"} {
+	// Redact any string that looks like an API key or token (starts with common prefixes)
+	for _, prefix := range []string{"sk-", "pk-", "api_", "token_", "ey", "access_token"} {
 		if strings.HasPrefix(strings.ToLower(input), prefix) {
-			return "[REDACTED_API_KEY]"
+			return "[REDACTED_TOKEN]"
 		}
 	}
+	// Redact client secrets and IDs if they appear in logs
+	if len(input) > 20 && (strings.Contains(strings.ToLower(input), "secret") || strings.Contains(strings.ToLower(input), "client")) {
+		return "[REDACTED_CREDENTIALS]"
+	}
 	return input
+}
+
+// NewOAuthClient creates a new OAuth client for Client Credentials flow
+func NewOAuthClient(tokenEndpoint, clientID, clientSecret, scope string) *OAuthClient {
+	return &OAuthClient{
+		httpClient:    &http.Client{Timeout: 30 * time.Second},
+		tokenEndpoint: tokenEndpoint,
+		clientID:      clientID,
+		clientSecret:  clientSecret,
+		scope:         scope,
+	}
+}
+
+// GetAccessToken retrieves a valid access token, refreshing if necessary
+func (o *OAuthClient) GetAccessToken(ctx context.Context) (string, error) {
+	o.mutex.RLock()
+	// Check if we have a valid token (with 30 second buffer)
+	if o.accessToken != "" && time.Now().Add(30*time.Second).Before(o.expiresAt) {
+		token := o.accessToken
+		o.mutex.RUnlock()
+		return token, nil
+	}
+	o.mutex.RUnlock()
+
+	// Need to get a new token
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+
+	// Double-check after acquiring write lock
+	if o.accessToken != "" && time.Now().Add(30*time.Second).Before(o.expiresAt) {
+		return o.accessToken, nil
+	}
+
+	return o.requestNewToken(ctx)
+}
+
+// requestNewToken requests a new access token using Client Credentials flow
+func (o *OAuthClient) requestNewToken(ctx context.Context) (string, error) {
+	// Prepare form-encoded token request (OAuth 2.0 standard)
+	data := url.Values{}
+	data.Set("grant_type", "client_credentials")
+	data.Set("client_id", o.clientID)
+	data.Set("client_secret", o.clientSecret)
+	if o.scope != "" {
+		data.Set("scope", o.scope)
+	}
+
+	// Create HTTP request with form data
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", o.tokenEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("failed to create token request: %w", err)
+	}
+
+	// Set headers for OAuth token request (form-encoded)
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	httpReq.Header.Set("Accept", "application/json")
+
+	zerologlog.Debug().
+		Str("token_endpoint", o.tokenEndpoint).
+		Str("client_id", sanitizeForLogging(o.clientID)).
+		Str("scope", o.scope).
+		Msg("Requesting OAuth access token")
+
+	// Make token request
+	resp, err := o.httpClient.Do(httpReq)
+	if err != nil {
+		zerologlog.Error().Err(err).
+			Str("token_endpoint", o.tokenEndpoint).
+			Msg("OAuth token request failed")
+		return "", fmt.Errorf("OAuth token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read token response: %w", err)
+	}
+
+	// Parse token response
+	var tokenResp OAuthTokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		zerologlog.Error().Err(err).
+			Str("body", string(body)).
+			Msg("Failed to parse OAuth token response")
+		return "", fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	// Check for OAuth errors
+	if tokenResp.Error != "" {
+		zerologlog.Error().
+			Str("error", tokenResp.Error).
+			Str("error_description", tokenResp.ErrorDesc).
+			Int("status_code", resp.StatusCode).
+			Msg("OAuth token request error")
+		return "", fmt.Errorf("OAuth error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+	}
+
+	// Check HTTP status
+	if resp.StatusCode != http.StatusOK {
+		zerologlog.Error().
+			Int("status_code", resp.StatusCode).
+			Str("body", string(body)).
+			Msg("OAuth token endpoint returned non-200 status")
+		return "", fmt.Errorf("OAuth token endpoint returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Validate token response
+	if tokenResp.AccessToken == "" {
+		return "", fmt.Errorf("received empty access token")
+	}
+
+	// Update stored token with expiration (default to 1 hour if not provided)
+	expiresIn := tokenResp.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 3600 // Default to 1 hour
+	}
+
+	o.accessToken = tokenResp.AccessToken
+	o.expiresAt = time.Now().Add(time.Duration(expiresIn) * time.Second)
+
+	zerologlog.Debug().
+		Str("token_type", tokenResp.TokenType).
+		Int("expires_in", tokenResp.ExpiresIn).
+		Time("expires_at", o.expiresAt).
+		Msg("Successfully obtained OAuth access token")
+
+	return o.accessToken, nil
 }
 
 // promptSystem returns the system prompt for the OpenAI model
@@ -136,24 +301,21 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// LyricsService handles the lyrics generation logic using direct HTTP calls
+// LyricsService handles the lyrics generation logic using AI Gateway with OAuth
 type LyricsService struct {
-	httpClient *http.Client
-	apiKey     string
-	baseURL    string
-	model      string
+	httpClient  *http.Client
+	oauthClient *OAuthClient
+	gatewayURL  string
+	model       string
 }
 
-// NewLyricsService creates a new lyrics service with direct HTTP API calls
-func NewLyricsService(apiKey, baseURL, model string) *LyricsService {
-	if baseURL == "" {
-		baseURL = "https://api.openai.com"
-	}
+// NewLyricsService creates a new lyrics service with AI Gateway and OAuth
+func NewLyricsService(gatewayURL, model string, oauthClient *OAuthClient) *LyricsService {
 	return &LyricsService{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		apiKey:     apiKey,
-		baseURL:    baseURL,
-		model:      model,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		oauthClient: oauthClient,
+		gatewayURL:  gatewayURL,
+		model:       model,
 	}
 }
 
@@ -212,14 +374,29 @@ func main() {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 
-	// Get OpenAI API key
-	openaiKey := os.Getenv("OPENAI_API_KEY")
-	if openaiKey == "" {
-		zerologlog.Fatal().Msg("OPENAI_API_KEY environment variable is required")
+	// Get AI Gateway OAuth configuration
+	consumerKey := os.Getenv("AI_GATEWAY_CONSUMER_KEY")
+	if consumerKey == "" {
+		zerologlog.Fatal().Msg("AI_GATEWAY_CONSUMER_KEY environment variable is required")
 	}
 
-	// Get custom OpenAI base URL (optional)
-	openaiBaseURL := os.Getenv("OPENAI_BASE_URL")
+	consumerSecret := os.Getenv("AI_GATEWAY_CONSUMER_SECRET")
+	if consumerSecret == "" {
+		zerologlog.Fatal().Msg("AI_GATEWAY_CONSUMER_SECRET environment variable is required")
+	}
+
+	tokenEndpoint := os.Getenv("AI_GATEWAY_TOKEN_ENDPOINT")
+	if tokenEndpoint == "" {
+		zerologlog.Fatal().Msg("AI_GATEWAY_TOKEN_ENDPOINT environment variable is required")
+	}
+
+	gatewayURL := os.Getenv("AI_GATEWAY_ENDPOINT")
+	if gatewayURL == "" {
+		zerologlog.Fatal().Msg("AI_GATEWAY_ENDPOINT environment variable is required")
+	}
+
+	// Get optional OAuth scope (default to empty)
+	oauthScope := os.Getenv("AI_GATEWAY_SCOPE")
 
 	// Get model version (default: gpt-3.5-turbo)
 	openaiModel := os.Getenv("OPENAI_MODEL")
@@ -233,8 +410,18 @@ func main() {
 		port = "8080"
 	}
 
-	// Initialize services
-	lyricsService := NewLyricsService(openaiKey, openaiBaseURL, openaiModel)
+	// Initialize OAuth client
+	oauthClient := NewOAuthClient(tokenEndpoint, consumerKey, consumerSecret, oauthScope)
+
+	zerologlog.Info().
+		Str("token_endpoint", tokenEndpoint).
+		Str("gateway_url", gatewayURL).
+		Str("consumer_key", sanitizeForLogging(consumerKey)).
+		Str("model", openaiModel).
+		Msg("Initializing AI Gateway with OAuth Client Credentials")
+
+	// Initialize services with AI Gateway
+	lyricsService := NewLyricsService(gatewayURL, openaiModel, oauthClient)
 
 	// Setup Gin router
 	router := gin.Default()
@@ -371,12 +558,19 @@ func generateLyrics(service *LyricsService) gin.HandlerFunc {
 	}
 }
 
-// GenerateLyrics generates song lyrics using direct OpenAI HTTP API
+// GenerateLyrics generates song lyrics using AI Gateway with OAuth authentication
 func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (*LyricsResponse, error) {
 	// Create prompt
 	prompt := s.buildPrompt(req)
 
-	// Prepare OpenAI request
+	// Get OAuth access token
+	accessToken, err := s.oauthClient.GetAccessToken(ctx)
+	if err != nil {
+		zerologlog.Error().Err(err).Msg("Failed to get OAuth access token")
+		return nil, fmt.Errorf("OAuth authentication failed: %w", err)
+	}
+
+	// Prepare OpenAI request for AI Gateway
 	openaiReq := OpenAIChatRequest{
 		Model: s.model,
 		Messages: []OpenAIChatMessage{
@@ -393,33 +587,34 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create HTTP request
-	url := s.baseURL + "/v1/chat/completions"
+	// Create HTTP request to AI Gateway
+	url := s.gatewayURL + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set headers
+	// Set headers with OAuth Bearer token
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	httpReq.Header.Set("Authorization", "Bearer "+accessToken)
 
 	// Log request (with sanitization)
 	zerologlog.Debug().
 		Str("model", s.model).
-		Str("url", url).
+		Str("gateway_url", url).
 		Str("prompt", sanitizeForLogging(prompt)).
+		Str("authorization", sanitizeForLogging("Bearer "+accessToken)).
 		Interface("request", req).
-		Msg("Sending request to OpenAI")
+		Msg("Sending request to AI Gateway")
 
 	// Make HTTP request
 	resp, err := s.httpClient.Do(httpReq)
 	if err != nil {
 		zerologlog.Error().Err(err).
 			Str("model", s.model).
-			Str("url", url).
-			Msg("HTTP request failed")
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+			Str("gateway_url", url).
+			Msg("AI Gateway HTTP request failed")
+		return nil, fmt.Errorf("AI Gateway HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -434,7 +629,7 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 	if err := json.Unmarshal(body, &openaiResp); err != nil {
 		zerologlog.Error().Err(err).
 			Str("body", string(body)).
-			Msg("Failed to parse OpenAI response")
+			Msg("Failed to parse AI Gateway response")
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
@@ -444,8 +639,8 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 			Str("error_type", openaiResp.Error.Type).
 			Str("error_message", openaiResp.Error.Message).
 			Interface("error_code", openaiResp.Error.Code).
-			Msg("OpenAI API error")
-		return nil, fmt.Errorf("OpenAI API error: %s", openaiResp.Error.Message)
+			Msg("AI Gateway API error")
+		return nil, fmt.Errorf("AI Gateway API error: %s", openaiResp.Error.Message)
 	}
 
 	// Check HTTP status
@@ -453,8 +648,8 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 		zerologlog.Error().
 			Int("status_code", resp.StatusCode).
 			Str("body", string(body)).
-			Msg("OpenAI API returned non-200 status")
-		return nil, fmt.Errorf("OpenAI API returned status %d: %s", resp.StatusCode, string(body))
+			Msg("AI Gateway returned non-200 status")
+		return nil, fmt.Errorf("AI Gateway returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	// Validate response
@@ -462,8 +657,8 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 		zerologlog.Error().
 			Str("model", s.model).
 			Str("response", string(body)).
-			Msg("OpenAI API returned no choices")
-		return nil, fmt.Errorf("no response from OpenAI")
+			Msg("AI Gateway returned no choices")
+		return nil, fmt.Errorf("no response from AI Gateway")
 	}
 
 	generatedText := openaiResp.Choices[0].Message.Content
@@ -487,7 +682,7 @@ func (s *LyricsService) GenerateLyrics(ctx context.Context, req LyricsRequest) (
 		Str("response_id", lyricsResponse.ID).
 		Int("word_count", wordCount).
 		Str("title", lyrics.Title).
-		Msg("Successfully generated lyrics")
+		Msg("Successfully generated lyrics via AI Gateway")
 
 	return lyricsResponse, nil
 }
