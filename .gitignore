@@ -34,3 +34,4 @@ songlyrics-api
 # Editor/IDE
 # .idea/
 # .vscode/
+server.log
